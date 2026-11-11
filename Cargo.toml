@@ -1,0 +1,35 @@
+[package]
+name = "beyond-schema-dumper"
+version = "0.1.0"
+edition = "2021"
+description = "Dumps MemoryPack schema of beyond game from global-metadata.dat and GameAssembly.dll"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/SherkeyXD/beyond-schema-dumper"
+keywords = ["memorypack", "schema", "il2cpp", "dumper"]
+categories = ["command-line-utilities", "development-tools"]
+
+[lib]
+name = "beyond_schema_dumper"
+path = "src/lib.rs"
+
+[[bin]]
+name = "beyond-schema-dumper"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+indexmap = "=2.6.0" # preserve compatibility with MSRV Rust 1.83
+lz4_flex = "0.14"
+rmp-serde = "1.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+thiserror = "1.0"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

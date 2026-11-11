@@ -1,0 +1,10 @@
+/target
+/out
+/release-assets
+*.tar.gz
+*.zip
+**/__pycache__/
+**/*.pyc
+**/*.rs.bk
+*.swp
+.DS_Store
