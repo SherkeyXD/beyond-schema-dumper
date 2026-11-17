@@ -425,10 +425,12 @@ pub fn build_schema_document(
 
     apply_inherited_wire(&mut wrappers, &ts, &instance_size);
 
+    // Roots only: wrapper wire names and the target type. Nested fields of an
+    // exported unmanaged valuetype are closed inside `collect_layouts`.
     let mut referenced = HashSet::new();
     for w in &wrappers {
         for m in &w.wire_order {
-            collect_type_names(&m.ty, &mut referenced);
+            crate::wire::collect_type_names(&m.ty, &mut referenced);
         }
         if let Some(t) = &w.target_type {
             referenced.insert(t.clone());
@@ -1237,18 +1239,6 @@ fn apply_native_member_counts(wrappers: &mut [WrapperSchema], counts: &BTreeMap<
         if let Some(&n) = n {
             w.native_member_count = Some(n);
         }
-    }
-}
-
-fn collect_type_names(ty: &str, out: &mut HashSet<String>) {
-    out.insert(ty.to_string());
-    if let Some((_, args)) = crate::wire::split_generic(ty) {
-        for a in args {
-            collect_type_names(&a, out);
-        }
-    }
-    if let Some(elem) = ty.strip_suffix("[]") {
-        collect_type_names(elem.trim(), out);
     }
 }
 
