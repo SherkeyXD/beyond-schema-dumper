@@ -3,7 +3,7 @@ use crate::pe::PeImage;
 use crate::reg::MetadataRegistration;
 use crate::typesys::{field_attrs, TypeSystem};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 pub const VALUETYPE_BIT: u32 = 1 << 0;
 pub const ENUMTYPE_BIT: u32 = 1 << 1;
@@ -164,18 +164,15 @@ pub fn collect_layouts(
         }
     }
 
+    // Roots are wrapper wire names. Instance fields of those layouts name
+    // further unmanaged valuetypes (BezierKnot -> float3/quaternion -> float4)
+    // that never appear on a wire. Close that set before emitting.
+    let referenced =
+        close_exported_unmanaged_dependencies(meta, ts, field_offs, &memcpy_ok, referenced);
+
     for (ti, td) in meta.type_defs.iter().enumerate() {
         let name = ts.typedef_full_name(ti as i32);
-        if is_enumtype(td) || !is_valuetype(td) {
-            continue;
-        }
-        if !referenced.contains(&name) && !is_unity_packed(&name) {
-            continue;
-        }
-        // native_size > 0 is not enough: valuetypes that hold a string/object
-        // pointer still have a native size (the pointer width). Only emit
-        // types whose instance fields are primitives, enums, or nested memcpy.
-        if !memcpy_ok[ti] && !is_unity_packed(&name) {
+        if !exports_as_unmanaged(&name, ti, td, &memcpy_ok, &referenced) {
             continue;
         }
         if let Some(layout) = unmanaged_layout(
@@ -185,7 +182,7 @@ pub fn collect_layouts(
         }
     }
 
-    emit_closed_generic_unmanaged(&mut unmanaged, &enums, referenced);
+    emit_closed_generic_unmanaged(&mut unmanaged, &enums, &referenced);
 
     TypeLayouts {
         instance_size: type_sizes.iter().map(|s| s.instance_size).collect(),
@@ -437,82 +434,182 @@ fn align_n(n: i32, align: i32) -> i32 {
     }
 }
 
+/// `native_size > 0` is not enough: a valuetype that holds a string or object
+/// pointer still has a native size (the pointer width). Only emit types whose
+/// instance fields are primitives, enums, or nested memcpy valuetypes.
+/// Unity packed names stay emitted even when that check fails, matching the
+/// historical Vector/Quaternion/Color entries.
+fn exports_as_unmanaged(
+    name: &str,
+    ti: usize,
+    td: &TypeDefinition,
+    memcpy_ok: &[bool],
+    referenced: &HashSet<String>,
+) -> bool {
+    if is_enumtype(td) || !is_valuetype(td) {
+        return false;
+    }
+    let packed = is_unity_packed(name);
+    if !referenced.contains(name) && !packed {
+        return false;
+    }
+    memcpy_ok.get(ti).copied().unwrap_or(false) || packed
+}
+
+/// Fixed point of instance-field type dependencies of layouts that would be
+/// exported. Each typedef is expanded once, in index order, so a cycle
+/// (`A` contains `B` contains `A`) terminates and the result does not depend
+/// on `HashSet` iteration. Field spellings go through [`crate::wire::collect_type_names`]
+/// (byref, generic arguments, `T[]`) so the closed name matches `typedef_full_name`.
+fn close_exported_unmanaged_dependencies(
+    meta: &Metadata,
+    ts: &mut TypeSystem<'_>,
+    field_offs: &HashMap<(usize, usize), i32>,
+    memcpy_ok: &[bool],
+    referenced: &HashSet<String>,
+) -> HashSet<String> {
+    let mut by_name: HashMap<String, Vec<usize>> = HashMap::new();
+    for (ti, td) in meta.type_defs.iter().enumerate() {
+        if !is_valuetype(td) || is_enumtype(td) {
+            continue;
+        }
+        by_name
+            .entry(ts.typedef_full_name(ti as i32))
+            .or_default()
+            .push(ti);
+    }
+
+    let mut closed = referenced.clone();
+    let mut pending = BTreeSet::new();
+    for (name, indexes) in &by_name {
+        for &ti in indexes {
+            let Some(td) = meta.type_defs.get(ti) else {
+                continue;
+            };
+            if exports_as_unmanaged(name, ti, td, memcpy_ok, &closed) {
+                pending.insert(ti);
+            }
+        }
+    }
+
+    let mut expanded = HashSet::new();
+    while let Some(ti) = pending.pop_first() {
+        if !expanded.insert(ti) {
+            continue;
+        }
+        let Some(td) = meta.type_defs.get(ti).cloned() else {
+            continue;
+        };
+        let mut deps = HashSet::new();
+        for field in instance_fields(meta, ts, ti, &td, field_offs) {
+            crate::wire::collect_type_names(&field.ty, &mut deps);
+        }
+        let mut deps: Vec<String> = deps.into_iter().collect();
+        deps.sort();
+        for dep in deps {
+            let indexes = by_name.get(&dep).cloned().unwrap_or_default();
+            closed.insert(dep.clone());
+            for dep_ti in indexes {
+                if expanded.contains(&dep_ti) {
+                    continue;
+                }
+                let Some(dep_td) = meta.type_defs.get(dep_ti) else {
+                    continue;
+                };
+                if exports_as_unmanaged(&dep, dep_ti, dep_td, memcpy_ok, &closed) {
+                    pending.insert(dep_ti);
+                }
+            }
+        }
+    }
+    closed
+}
+
 fn emit_closed_generic_unmanaged(
     unmanaged: &mut BTreeMap<String, UnmanagedLayout>,
     enums: &BTreeMap<String, EnumLayout>,
     referenced: &HashSet<String>,
 ) {
-    let names: Vec<String> = referenced.iter().cloned().collect();
-    for name in names {
-        if unmanaged.contains_key(&name) {
-            continue;
-        }
-        let Some((head, args)) = crate::wire::split_generic(&name) else {
-            continue;
-        };
-        let leaf = head.rsplit('.').next().unwrap_or(head);
-        if leaf.starts_with("ValueTuple`") {
-            if let Some(layout) = value_tuple_layout(&name, &args, enums, unmanaged) {
-                unmanaged.insert(name.clone(), layout);
+    // Sorted and repeated until a pass adds nothing. `ValueTuple<Nullable<T>>`
+    // is only sized after `Nullable<T>` itself has been inserted, and HashSet
+    // order must not drop that layout.
+    let mut names: Vec<&String> = referenced.iter().collect();
+    names.sort();
+    let mut progressed = true;
+    while progressed {
+        progressed = false;
+        for name in &names {
+            if unmanaged.contains_key(name.as_str()) {
+                continue;
             }
-            continue;
+            let Some(layout) = closed_generic_layout(name, enums, unmanaged) else {
+                continue;
+            };
+            unmanaged.insert((*name).clone(), layout);
+            progressed = true;
         }
-        if args.len() != 1 {
-            continue;
-        }
-        let (flag_name, status) = if leaf.starts_with("Nullable`") {
-            ("hasValue", "il2cpp_nullable_unmanaged")
-        } else if leaf.starts_with("Optional`") {
-            // Nested Beyond.Optional<T> of a memcpy T is ReadUnmanaged of
-            // sizeof(Optional<T>), not the Optional ForMemoryPack object header.
-            // Evidence: InteractiveTemplateVariant.cctor after cmp memberCount
-            // 14: 8-byte Optional<enum>/float, later 2-byte Optional<bool>.
-            ("enabled", "il2cpp_optional_unmanaged")
-        } else {
-            continue;
-        };
-        let inner = &args[0];
-        let Some((inner_size, inner_align)) = inner_memcpy_size_align(inner, enums, unmanaged)
-        else {
-            continue;
-        };
-        let payload = if status.starts_with("il2cpp_optional") {
-            optional_memcpy_payload(inner_size, inner_align)
-        } else {
-            nullable_memcpy_payload(inner_size, inner_align)
-        };
-        if payload <= 0 {
-            continue;
-        }
-        let value_off = align_n(1, inner_align.max(1));
-        unmanaged.insert(
-            name.clone(),
-            UnmanagedLayout {
-                type_name: name,
-                typedef_index: 0,
-                instance_size: 16 + payload,
-                native_size: payload,
-                payload_size: payload,
-                blittable: true,
-                fields: vec![
-                    UnmanagedField {
-                        name: flag_name.into(),
-                        ty: "bool".into(),
-                        offset: 0,
-                        size: Some(1),
-                    },
-                    UnmanagedField {
-                        name: "value".into(),
-                        ty: inner.clone(),
-                        offset: value_off,
-                        size: Some(inner_size),
-                    },
-                ],
-                status: status.into(),
-                collection_encoding: None,
-            },
-        );
     }
+}
+
+fn closed_generic_layout(
+    name: &str,
+    enums: &BTreeMap<String, EnumLayout>,
+    unmanaged: &BTreeMap<String, UnmanagedLayout>,
+) -> Option<UnmanagedLayout> {
+    let (head, args) = crate::wire::split_generic(name)?;
+    let leaf = head.rsplit('.').next().unwrap_or(head);
+    if leaf.starts_with("ValueTuple`") {
+        return value_tuple_layout(name, &args, enums, unmanaged);
+    }
+    if args.len() != 1 {
+        return None;
+    }
+    let (flag_name, status) = if leaf.starts_with("Nullable`") {
+        ("hasValue", "il2cpp_nullable_unmanaged")
+    } else if leaf.starts_with("Optional`") {
+        // Nested Beyond.Optional<T> of a memcpy T is ReadUnmanaged of
+        // sizeof(Optional<T>), not the Optional ForMemoryPack object header.
+        // Evidence: InteractiveTemplateVariant.cctor after cmp memberCount
+        // 14: 8-byte Optional<enum>/float, later 2-byte Optional<bool>.
+        ("enabled", "il2cpp_optional_unmanaged")
+    } else {
+        return None;
+    };
+    let inner = &args[0];
+    let (inner_size, inner_align) = inner_memcpy_size_align(inner, enums, unmanaged)?;
+    let payload = if status.starts_with("il2cpp_optional") {
+        optional_memcpy_payload(inner_size, inner_align)
+    } else {
+        nullable_memcpy_payload(inner_size, inner_align)
+    };
+    if payload <= 0 {
+        return None;
+    }
+    let value_off = align_n(1, inner_align.max(1));
+    Some(UnmanagedLayout {
+        type_name: name.to_string(),
+        typedef_index: 0,
+        instance_size: 16 + payload,
+        native_size: payload,
+        payload_size: payload,
+        blittable: true,
+        fields: vec![
+            UnmanagedField {
+                name: flag_name.into(),
+                ty: "bool".into(),
+                offset: 0,
+                size: Some(1),
+            },
+            UnmanagedField {
+                name: "value".into(),
+                ty: inner.clone(),
+                offset: value_off,
+                size: Some(inner_size),
+            },
+        ],
+        status: status.into(),
+        collection_encoding: None,
+    })
 }
 
 /// Closed `ValueTuple<T…>` of memcpy args is sequential unmanaged items.
@@ -726,5 +823,46 @@ mod tests {
             inner_memcpy_size_align("UnityEngine.Vector3", &enums, &unmanaged),
             Some((12, 4))
         );
+    }
+
+    #[test]
+    fn mathematics_names_are_not_unity_packed() {
+        assert!(!super::is_unity_packed("Unity.Mathematics.float3"));
+        assert!(!super::is_unity_packed("Unity.Mathematics.float4"));
+        assert!(!super::is_unity_packed("Unity.Mathematics.quaternion"));
+        assert!(!super::is_unity_packed("Unity.Mathematics.float2"));
+    }
+
+    #[test]
+    fn nested_generic_unmanaged_does_not_depend_on_hash_order() {
+        use std::collections::{BTreeMap, HashSet};
+        let enums = BTreeMap::new();
+        let referenced: HashSet<String> = [
+            "Aaa.ValueTuple`1<Zzz.Nullable`1<float>>".to_string(),
+            "Zzz.Nullable`1<float>".to_string(),
+        ]
+        .into_iter()
+        .collect();
+        let mut first = BTreeMap::new();
+        super::emit_closed_generic_unmanaged(&mut first, &enums, &referenced);
+        let mut second = BTreeMap::new();
+        super::emit_closed_generic_unmanaged(&mut second, &enums, &referenced);
+        assert_eq!(
+            serde_json::to_string(&first).unwrap(),
+            serde_json::to_string(&second).unwrap()
+        );
+        let nullable = first.get("Zzz.Nullable`1<float>").expect("nullable");
+        assert_eq!(nullable.payload_size, 8);
+        assert_eq!(nullable.fields[0].name, "hasValue");
+        assert_eq!(nullable.fields[1].name, "value");
+        assert_eq!(nullable.fields[1].ty, "float");
+        let tuple = first
+            .get("Aaa.ValueTuple`1<Zzz.Nullable`1<float>>")
+            .expect("tuple depends on nullable being emitted first");
+        assert_eq!(tuple.payload_size, 8);
+        assert_eq!(tuple.fields.len(), 1);
+        assert_eq!(tuple.fields[0].ty, "Zzz.Nullable`1<float>");
+        assert_eq!(tuple.fields[0].offset, 0);
+        assert_eq!(tuple.fields[0].size, Some(8));
     }
 }

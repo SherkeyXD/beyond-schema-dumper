@@ -39,10 +39,13 @@ pub fn load_code_map(pe: &PeImage, meta: &Metadata) -> Result<CodeMap> {
         };
         let start = img.type_start.max(0) as usize;
         let end = (start + img.type_count as usize).min(meta.type_defs.len());
-        let mut meta_methods = 0usize;
-        for ti in start..end {
-            meta_methods += meta.type_defs[ti].method_count as usize;
-        }
+        let meta_methods: usize = meta
+            .type_defs
+            .iter()
+            .take(end)
+            .skip(start)
+            .map(|td| td.method_count as usize)
+            .sum();
         eprintln!(
             "codegen {} pointers={} metadata_methods={}",
             name, count, meta_methods

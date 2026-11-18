@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WireKind {
     Bool,
@@ -168,6 +170,31 @@ pub fn split_top_level(s: &str) -> Vec<String> {
     out
 }
 
+/// Insert `ty` and the type names nested inside it.
+///
+/// A single trailing byref `&` is removed first, matching [`classify`]. Generic
+/// arguments and a single `T[]` rank are walked the same way wrapper
+/// `wire_order` roots are collected. Multi-dimensional arrays (`T[,]`) and
+/// pointers (`T*`) stay one name, because that is all [`classify`] understands.
+/// Re-visiting a name stops the walk, so a self-similar spelling cannot loop.
+pub(crate) fn collect_type_names(ty: &str, out: &mut HashSet<String>) {
+    let mut t = ty.trim();
+    if let Some(stripped) = t.strip_suffix('&') {
+        t = stripped.trim();
+    }
+    if t.is_empty() || !out.insert(t.to_string()) {
+        return;
+    }
+    if let Some((_, args)) = split_generic(t) {
+        for arg in args {
+            collect_type_names(&arg, out);
+        }
+    }
+    if let Some(elem) = t.strip_suffix("[]") {
+        collect_type_names(elem.trim(), out);
+    }
+}
+
 pub fn basename_of(type_name: &str) -> String {
     let head = type_name.split('<').next().unwrap_or(type_name);
     head.rsplit('.').next().unwrap_or(head).to_string()
@@ -201,5 +228,43 @@ mod tests {
             basename_of("Beyond.Gameplay.BambooRaftTaskTable"),
             "BambooRaftTaskTable"
         );
+    }
+
+    #[test]
+    fn collect_type_names_peels_generics_arrays_and_byref() {
+        let mut got = HashSet::new();
+        collect_type_names(
+            " System.Collections.Generic.List`1<Ns.Holder`1<Ns.Inner[]>& > ",
+            &mut got,
+        );
+        let mut names: Vec<_> = got.into_iter().collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "Ns.Holder`1<Ns.Inner[]>".to_string(),
+                "Ns.Inner".to_string(),
+                "Ns.Inner[]".to_string(),
+                "System.Collections.Generic.List`1<Ns.Holder`1<Ns.Inner[]>& >".to_string(),
+            ]
+        );
+
+        let mut nested = HashSet::new();
+        collect_type_names("Foo<Foo>", &mut nested);
+        assert_eq!(nested.len(), 2);
+        assert!(nested.contains("Foo<Foo>"));
+        assert!(nested.contains("Foo"));
+
+        let mut matrix = HashSet::new();
+        collect_type_names("Bar[,]", &mut matrix);
+        assert_eq!(matrix, HashSet::from(["Bar[,]".to_string()]));
+
+        let mut pointer = HashSet::new();
+        collect_type_names("Foo*", &mut pointer);
+        assert_eq!(pointer, HashSet::from(["Foo*".to_string()]));
+
+        let mut prim = HashSet::new();
+        collect_type_names("float", &mut prim);
+        assert_eq!(prim, HashSet::from(["float".to_string()]));
     }
 }
